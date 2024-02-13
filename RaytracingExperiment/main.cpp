@@ -19,7 +19,13 @@
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3native.h>
 
+// forces GLM to use radians always
+#define GLM_FORCE_RADIANS
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
+// for consistent timekeeping, for animating the rectangle through uniform buffers.
+#include <chrono>
 
 struct GLFWwindow_deletor {
 
@@ -62,6 +68,12 @@ struct Vertex {
 
         return attributeDescriptions;
     }
+};
+
+struct UniformBufferObject {
+    glm::mat4 model;
+    glm::mat4 view;
+    glm::mat4 proj;
 };
 
 struct QueueFamilyIndices {
@@ -165,6 +177,15 @@ private:
     VkDeviceMemory vertexBufferMemory;
     VkBuffer indexBuffer;
     VkDeviceMemory indexBufferMemory;
+    
+    // need at least one set per frame 
+    std::vector<VkBuffer> uniformBuffers;
+    std::vector<VkDeviceMemory> uniformBuffersMemory;
+    std::vector<void*> uniformBuffersMapped; // this will be pointers mapped to GPU memory in order to provide the matrix data?
+
+    VkDescriptorSetLayout descriptorSetLayout;
+    VkDescriptorPool descriptorPool;
+    std::vector<VkDescriptorSet> descriptorSets;
 
     std::vector <VkSemaphore> imageAvailableSemaphores;
     std::vector <VkSemaphore> renderFinishedSemaphores;
@@ -198,11 +219,15 @@ private:
         createSwapChain(); // requires a device
         createImageViews(); // requires a swap chain
         createRenderPass();
+        createDescriptorSetLayout();
         createGraphicsPipeline();
         createFramebuffers();
         createCommandPool(); // memory management/allocation for buffers
         createVertexBuffer();
         createIndexBuffer();
+        createUniformBuffers();
+        createDescriptorPool();
+        createDescriptorSets();
         createCommandBuffer(); // collects commands for batch sending to vulkan, allowing vulkan to optimize
         createSyncObjects();
     }
@@ -247,6 +272,8 @@ private:
         vkResetCommandBuffer(commandBuffers[currentFrame], 0);
         recordCommandBuffer(commandBuffers[currentFrame], imageIndex);
 
+        updateUniformBuffer(currentFrame);
+
         VkSubmitInfo submitInfo{};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 
@@ -280,6 +307,37 @@ private:
         vkQueuePresentKHR(presentQueue, &presentInfo);
 
         currentFrame = (currentFrame + 1) & MAX_FRAMES_IN_FLIGHT;
+    }
+    
+    void updateUniformBuffer(uint32_t currentFrame) {
+        static auto startTime = std::chrono::high_resolution_clock::now();
+
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
+
+        UniformBufferObject ubo{};
+
+        // rotate(starting-transformation, angle, axis-of-rotation)
+        // model transformation -> take the model coordinates and put them somewhere in world space.
+        // in this case, a rotation around the z-axis. it will be "placed" at the origin.
+        ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+
+        // lookAt(eye-position, centre position, up axis) -> point, eye-viewing-direction, up-direction-of-world.
+        // view transformation -> take the coordinates and transform them into coords relative to the eye and eye-direction-vector.
+        // in this case, eye is at (2, 2, 2), looking at origin. up vector is simple the unit z vector
+        ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 0.2f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+
+        // perspective(FOV, width/height ratio, near/far view planes
+        // perspective transformation -> take the view space coords and transform them according to the properties of the "camera"
+        ubo.proj = glm::perspective(glm::radians(45.0f), swapChainExtent.width / (float)swapChainExtent.height, 0.1f, 10.0f);
+        // GLM was designed for OpenGL, where the Y of clip coords is inverted. Vulkan does not. w/o this, the image will be upside down.
+        ubo.proj[1][1] *= -1;
+
+        // we left the memory mapped, so we can simply memcpy w/o remapping.
+        memcpy(uniformBuffersMapped[currentFrame], &ubo, sizeof(ubo));
+
+        // tutorial mentions this is not the most efficient way to frequently pass small buffers to shaders.
+        // push constants? I also saw this, something about byte limit -> 128 guarantee?
     }
 
     void createRenderPass() {
@@ -338,6 +396,25 @@ private:
             throw std::runtime_error("failed to create shader module!");
         }
         return shaderModule;
+    }
+
+    void createDescriptorSetLayout() {
+        VkDescriptorSetLayoutBinding uboLayoutBinding{};
+        uboLayoutBinding.binding = 0;
+        uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        uboLayoutBinding.descriptorCount = 1;
+
+        uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        uboLayoutBinding.pImmutableSamplers = nullptr; // for image sampling descriptors
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutInfo.bindingCount = 1;
+        layoutInfo.pBindings = &uboLayoutBinding;
+
+        if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create descriptor set layout!");
+        }
     }
 
     void createGraphicsPipeline() {
@@ -417,7 +494,7 @@ private:
         rasterizationState.polygonMode = VK_POLYGON_MODE_FILL; // fragments, points, lines. latter 2 requires GPU feature.
         rasterizationState.lineWidth = 1.0f; // thickness of lines in terms of fragments. >1.0f requires GPU feature.
         rasterizationState.cullMode = VK_CULL_MODE_BACK_BIT; // cull front faces, back faces, both, none?
-        rasterizationState.frontFace = VK_FRONT_FACE_CLOCKWISE; // front face of geometry if vertices defined clockwise.
+        rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; // front face of geometry if vertices defined clockwise.
         rasterizationState.depthBiasEnable = VK_FALSE;
         // below 3 are optional, since above is disabled. alters depth values according to the following params.
         rasterizationState.depthBiasConstantFactor = 0.0f;
@@ -466,8 +543,8 @@ private:
         // push constants are another method for dynamic values in shaders.
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
         pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pipelineLayoutInfo.setLayoutCount = 0;
-        pipelineLayoutInfo.pSetLayouts = nullptr;
+        pipelineLayoutInfo.setLayoutCount = 1;
+        pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
         pipelineLayoutInfo.pushConstantRangeCount = 0;
         pipelineLayoutInfo.pPushConstantRanges = nullptr;
 
@@ -672,6 +749,77 @@ private:
         vkFreeMemory(device, stagingBufferMemory, nullptr);
     }
 
+    void createUniformBuffers() {
+        VkDeviceSize bufferSize = sizeof(UniformBufferObject);
+
+        uniformBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+        uniformBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT);
+        uniformBuffersMapped.resize(MAX_FRAMES_IN_FLIGHT);
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+            // Remember that bufferMemory is the chunk of memory provided according to the property bits.
+            // Multiple buffers can be bound to one contiguous chunk of memory, we just aren't doing it here.
+            // bufferMapped ends up being a single pointer to the beginning of that chunk of memory.
+            createBuffer(bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, uniformBuffers[i], uniformBuffersMemory[i]);
+
+            vkMapMemory(device, uniformBuffersMemory[i], 0, bufferSize, 0, &uniformBuffersMapped[i]);
+        }
+    }
+
+    void createDescriptorPool() {
+        VkDescriptorPoolSize poolSize{};
+        poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        // remember: multiple descriptors because this is rapidly changing data
+        //  unlike vertex data, which is designed (this is why model space exists) to remain as static as possible before transformations in the pipeline
+        //  this data is meant to possibly change every frame. therefore we need multiple sets according to how many frames we could be drawing at once.
+        poolSize.descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.poolSizeCount = 1; // multiple pools in one call?
+        poolInfo.pPoolSizes = &poolSize;
+        poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+
+        if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create descriptor pool!");
+        }
+    }
+
+    void createDescriptorSets() {
+        std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, descriptorSetLayout);
+        VkDescriptorSetAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocInfo.descriptorPool = descriptorPool;
+        allocInfo.descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        allocInfo.pSetLayouts = layouts.data();
+
+        descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
+        if (vkAllocateDescriptorSets(device, &allocInfo, descriptorSets.data()) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate descriptor sets!");
+        }
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+            VkDescriptorBufferInfo bufferInfo{};
+            bufferInfo.buffer = uniformBuffers[i];
+            bufferInfo.offset = 0; // each
+            bufferInfo.range = sizeof(UniformBufferObject); // this can also be VK_WHOLE_SIZE here since we are overwriting the whole buffer.
+
+            VkWriteDescriptorSet descriptorWrite{};
+            descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrite.dstSet = descriptorSets[i];
+            descriptorWrite.dstBinding = 0;
+            descriptorWrite.dstArrayElement = 0;
+            descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            descriptorWrite.descriptorCount = 1;
+            descriptorWrite.pBufferInfo = &bufferInfo;
+            descriptorWrite.pImageInfo = nullptr; // opt; descriptor refers to image data
+            descriptorWrite.pTexelBufferView = nullptr; // opt; descriptor refers to buffer views .. research?
+
+            // latter two are for copying descriptor sets into one another.
+            vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+        }
+    }
+
     void createCommandBuffer() {
         commandBuffers.resize(MAX_FRAMES_IN_FLIGHT);
         QueueFamilyIndices queueFamilyIndices = findQueueFamilies(physicalDevice);
@@ -743,6 +891,8 @@ private:
         scissor.offset = { 0, 0 };
         scissor.extent = swapChainExtent;
         vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSets[currentFrame], 0, nullptr);
 
         // 1 & 3 for vertex count and buffer offset
         // 2 & 4 for instance count and offset ... ? what is instanced rendering .. research
@@ -1181,10 +1331,19 @@ private:
 
         vkDestroyBuffer(device, indexBuffer, nullptr);
         vkFreeMemory(device, indexBufferMemory, nullptr);
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+            vkDestroyBuffer(device, uniformBuffers[i], nullptr);
+            vkFreeMemory(device, uniformBuffersMemory[i], nullptr);
+        }
         
         vkDestroyPipeline(device, graphicsPipeline, nullptr);
         vkDestroyRenderPass(device, renderPass, nullptr);
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+
+        // descriptor sets are automatically freed when the pool containing them is destroyed.
+        vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+        vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 
         vkDestroyDevice(device, nullptr);
 
